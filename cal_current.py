@@ -131,11 +131,25 @@ class FieldCache:
             'total_entries': len(self.e_field_cache)
         }
 
+def _resolve_gauss_sampler(rng=None):
+    """统一处理不同随机数源的正态分布接口。"""
+    if rng is None:
+        return random.gauss
+
+    if hasattr(rng, "gauss") and callable(rng.gauss):
+        return rng.gauss
+
+    if hasattr(rng, "normal") and callable(rng.normal):
+        return lambda mean, sigma: float(rng.normal(mean, sigma))
+
+    raise TypeError("提供的随机数生成器不支持正态分布抽样")
+
+
 class VectorizedCarrierSystem:
     """向量化载流子系统 """
     
-    def __init__(self, all_positions, all_charges, all_times, material, carrier_type="electron", 
-                 read_out_contact=None, my_d=None):
+    def __init__(self, all_positions, all_charges, all_times, material, carrier_type="electron",
+                 read_out_contact=None, my_d=None, rng=None):
         # 输入数据验证
         self._validate_inputs(all_positions, all_charges, all_times)
             
@@ -163,10 +177,8 @@ class VectorizedCarrierSystem:
         self.kboltz = 8.617385e-5
         self.e0 = 1.60217733e-19
 
-        # 随机数生成器：保持可重复性同时避免全局状态污染
-        seed = random.random()
-        self._rng = random.Random()
-        self._rng.seed(seed)
+        # 随机数生成器：默认回退到模块级 random，使 random.seed() 完整生效
+        self._gauss = _resolve_gauss_sampler(rng)
         
         # 性能统计
         self.performance_stats = {
@@ -507,9 +519,9 @@ class VectorizedCarrierSystem:
             diffusion_sigma /= math.sqrt(carrier_count)
 
             diffs = (
-                self._rng.gauss(0.0, diffusion_sigma),
-                self._rng.gauss(0.0, diffusion_sigma),
-                self._rng.gauss(0.0, diffusion_sigma),
+                self._gauss(0.0, diffusion_sigma),
+                self._gauss(0.0, diffusion_sigma),
+                self._gauss(0.0, diffusion_sigma),
             )
             return diffs
         except Exception:
@@ -691,7 +703,7 @@ class CarrierCluster:
     Modify:
         2022/10/28
     """
-    def __init__(self, x_init, y_init, z_init, t_init, p_x, p_y, n_x, n_y, l_x, l_y, field_shift_x, field_shift_y, charge, material, weighting_field):
+    def __init__(self, x_init, y_init, z_init, t_init, p_x, p_y, n_x, n_y, l_x, l_y, field_shift_x, field_shift_y, charge, material, weighting_field, rng=None):
         self.x = x_init
         self.y = y_init
         self.z = z_init
@@ -729,10 +741,8 @@ class CarrierCluster:
         if self.charge == 0:
             self.end_condition = "zero charge"
 
-        # 独立的随机源，保留对全局 random.seed 的兼容
-        seed = random.random()
-        self._rng = random.Random()
-        self._rng.seed(seed)
+        # 随机源：默认直接使用模块 random，也支持注入自定义 RNG
+        self._gauss = _resolve_gauss_sampler(rng)
 
     def not_in_sensor(self,my_d):
         if (self.x<=0) or (self.x>=my_d.l_x)\
@@ -787,9 +797,9 @@ class CarrierCluster:
         diffusion /= math.sqrt(carrier_count)
 
         diffs = (
-            self._rng.gauss(0.0, diffusion) * 1e4,
-            self._rng.gauss(0.0, diffusion) * 1e4,
-            self._rng.gauss(0.0, diffusion) * 1e4,
+            self._gauss(0.0, diffusion) * 1e4,
+            self._gauss(0.0, diffusion) * 1e4,
+            self._gauss(0.0, diffusion) * 1e4,
         )
         dif_x, dif_y, dif_z = diffs
 
