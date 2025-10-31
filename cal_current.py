@@ -14,6 +14,7 @@ from array import array
 import csv
 import time
 import logging
+import random
 import numpy as np
 import ROOT
 ROOT.gROOT.SetBatch(True)
@@ -163,7 +164,9 @@ class VectorizedCarrierSystem:
         self.e0 = 1.60217733e-19
 
         # 随机数生成器：保持可重复性同时避免全局状态污染
-        self._rng = np.random.default_rng()
+        seed = random.random()
+        self._rng = random.Random()
+        self._rng.seed(seed)
         
         # 性能统计
         self.performance_stats = {
@@ -503,8 +506,12 @@ class VectorizedCarrierSystem:
             carrier_count = max(1.0, abs(charge))
             diffusion_sigma /= math.sqrt(carrier_count)
 
-            diffs = self._rng.normal(0.0, diffusion_sigma, size=3)
-            return float(diffs[0]), float(diffs[1]), float(diffs[2])
+            diffs = (
+                self._rng.gauss(0.0, diffusion_sigma),
+                self._rng.gauss(0.0, diffusion_sigma),
+                self._rng.gauss(0.0, diffusion_sigma),
+            )
+            return diffs
         except Exception:
             return 0.0, 0.0, 0.0
 
@@ -722,8 +729,10 @@ class CarrierCluster:
         if self.charge == 0:
             self.end_condition = "zero charge"
 
-        # 独立的随机源，避免与全局状态耦合
-        self._rng = np.random.default_rng()
+        # 独立的随机源，保留对全局 random.seed 的兼容
+        seed = random.random()
+        self._rng = random.Random()
+        self._rng.seed(seed)
 
     def not_in_sensor(self,my_d):
         if (self.x<=0) or (self.x>=my_d.l_x)\
@@ -777,8 +786,12 @@ class CarrierCluster:
         carrier_count = max(1.0, abs(self.charge))
         diffusion /= math.sqrt(carrier_count)
 
-        diffs = self._rng.normal(0.0, diffusion, size=3) * 1e4
-        dif_x, dif_y, dif_z = float(diffs[0]), float(diffs[1]), float(diffs[2])
+        diffs = (
+            self._rng.gauss(0.0, diffusion) * 1e4,
+            self._rng.gauss(0.0, diffusion) * 1e4,
+            self._rng.gauss(0.0, diffusion) * 1e4,
+        )
+        dif_x, dif_y, dif_z = diffs
 
         # sum up
         # x axis   
