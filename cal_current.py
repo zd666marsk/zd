@@ -19,9 +19,9 @@ import ROOT
 ROOT.gROOT.SetBatch(True)
 
 from .model import Material
-from interaction.carrier_list import CarrierListFromG4P
-from util.math import Vector, signal_convolution
-from util.output import output
+from ..interaction.carrier_list import CarrierListFromG4P
+from ..util.math import Vector, signal_convolution
+from ..util.output import output
 
 OPTIMIZATION_AVAILABLE = False
 FieldCache = None
