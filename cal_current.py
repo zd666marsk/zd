@@ -15,10 +15,50 @@ import csv
 import time
 import logging
 import random
+import importlib
 import numpy as np
 import ROOT
 ROOT.gROOT.SetBatch(True)
 
+
+def _import_first_available(*candidates):
+    """尝试依次导入候选模块，返回第一个成功的模块对象。"""
+
+    last_error = None
+    for dotted_path in candidates:
+        try:
+            return importlib.import_module(dotted_path)
+        except ModuleNotFoundError as exc:
+            last_error = exc
+        except ImportError as exc:  # 兼容较老 Python 版本的错误类型
+            last_error = exc
+
+    # 将最后一次导入错误转换成更易读的消息
+    raise ModuleNotFoundError(
+        "无法定位以下任一模块: {}".format(
+            ", ".join(candidates)
+        )
+    ) from last_error
+
+
+Material = _import_first_available("model", "raser.model", "current.model").Material
+CarrierListFromG4P = _import_first_available(
+    "interaction.carrier_list",
+    "raser.interaction.carrier_list",
+    "current.interaction.carrier_list",
+).CarrierListFromG4P
+math_module = _import_first_available(
+    "util.math",
+    "raser.util.math",
+    "current.util.math",
+)
+Vector = math_module.Vector
+signal_convolution = math_module.signal_convolution
+output = _import_first_available(
+    "util.output",
+    "raser.util.output",
+    "current.util.output",
+).output
 from .model import Material
 from ..interaction.carrier_list import CarrierListFromG4P
 from ..util.math import Vector, signal_convolution
@@ -271,6 +311,220 @@ class VectorizedCarrierSystem:
     
     def _get_param_safe(self, my_d, param_name, default, param_type=float):
         """安全获取参数"""
+        try:
+            value = getattr(my_d, param_name, default)
+            return param_type(value)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"参数 {param_name} 转换失败，使用默认值 {default}: {e}")
+            return default
+    
+    def _get_large_detector_defaults(self):
+        """大型器件默认参数"""
+        return {
+            'l_x': 10000.0, 'l_y': 10000.0, 'l_z': 300.0,
+            'p_x': 50.0, 'p_y': 50.0,
+            'n_x': 200, 'n_y': 200,
+            'field_shift_x': 0.0, 'field_shift_y': 0.0,
+            'temperature': 300.0,
+            'boundary_tolerance': 1.0,
+            'max_drift_time': 100e-9,
+            'min_field_strength': 1.0
+        }
+    
+    def _initialize_other_attributes(self, all_positions):
+        """初始化其他属性"""
+        # 初始化 reduced_positions
+        self.reduced_positions = np.zeros((len(all_positions), 2), dtype=np.float64)
+        for i, pos in enumerate(all_positions):
+            x, y, z = pos
+            x_reduced, y_reduced = self._calculate_reduced_coords(x, y, self.my_d)
+            self.reduced_positions[i] = [x_reduced, y_reduced]
+        
+        # 存储路径
+        self.paths = [[] for _ in range(len(all_positions))]
+        self.paths_reduced = [[] for _ in range(len(all_positions))]
+        
+        # 初始化路径数据
+        for i in range(len(all_positions)):
+            x, y, z = all_positions[i]
+            t = self.times[i]
+            self.paths[i].append([x, y, z, t])
+            
+            x_reduced, y_reduced = self.reduced_positions[i]
+            x_num, y_num = self._calculate_electrode_numbers(x, y)
+            self.paths_reduced[i].append([x_reduced, y_reduced, z, t, x_num, y_num])
+    
+    def _calculate_reduced_coords(self, x, y, my_d):
+        """计算简化坐标"""
+        params = self.detector_params
+        
+        use_reduced = (self.read_out_contact and 
+                      len(self.read_out_contact) == 1 and
+                      (self.read_out_contact[0].get('x_span', 0) != 0 or 
+                       self.read_out_contact[0].get('y_span', 0) != 0))
+        
+        if use_reduced:
+            x_reduced = (x - params['l_x']/2) % params['p_x'] + params['field_shift_x']
+            y_reduced = (y - params['l_y']/2) % params['p_y'] + params['field_shift_y']
+        else:
+            x_reduced = x
+            y_reduced = y
+        
+        return x_reduced, y_reduced
+    
+    def _calculate_electrode_numbers(self, x, y):
+        """计算电极编号"""
+        params = self.detector_params
+        try:
+            x_num = int((x - params['l_x']/2) // params['p_x'] + params['n_x']/2.0)
+            y_num = int((y - params['l_y']/2) // params['p_y'] + params['n_y']/2.0)
+            # 确保电极编号在合理范围内
+            x_num = max(0, min(params['n_x']-1, x_num))
+            y_num = max(0, min(params['n_y']-1, y_num))
+            return x_num, y_num
+        except Exception as e:
+            # 返回中心电极
+            return params['n_x']//2, params['n_y']//2
+
+    def _calculate_correct_mobility(self, temperature, doping, charge, electric_field):
+        """迁移率计算 """
+        try:
+            field_strength = np.linalg.norm(electric_field)
+            
+            # 硅的基本迁移率
+            if charge > 0:  # 空穴
+                mu_low_field = 480.0
+                beta = 1.0
+                vsat = 0.95e7
+            else:  # 电子
+                mu_low_field = 1350.0
+                beta = 2.0
+                vsat = 1.0e7
+            
+            # 高电场速度饱和模型
+            if field_strength > 1e3:
+                E0 = vsat / mu_low_field
+                mu = mu_low_field / (1 + (field_strength / E0) ** beta) ** (1 / beta)
+                mu = max(mu, vsat / field_strength)
+            else:
+                mu = mu_low_field
+            
+            return mu
+        except Exception as e:
+            logger.warning(f"迁移率计算失败，使用默认值: {e}")
+            return 1350.0 if charge < 0 else 480.0
+
+    def _check_boundary_conditions(self, x, y, z):
+        """边界条件检查 """
+        params = self.detector_params
+        l_x, l_y, l_z = params['l_x'], params['l_y'], params['l_z']
+        tolerance = params['boundary_tolerance']
+        
+        # 使用容差检查边界
+        out_of_bound = (x <= -tolerance or x >= l_x + tolerance or 
+                       y <= -tolerance or y >= l_y + tolerance or 
+                       z <= -tolerance or z >= l_z + tolerance)
+        
+        return out_of_bound
+
+    def drift_batch(self, my_d, field_cache, delta_t=1e-12, max_steps=5000):
+        """批量漂移主函数 """
+        logger.info(f"开始批量漂移{self.carrier_type}，最多{max_steps}步，时间步长{delta_t}s")
+        
+        start_time = time.time()
+        delta_t_cm = delta_t * 1e4
+        
+        total_carriers = len(self.active)
+        initial_active = np.sum(self.active)
+        
+        logger.info(f"初始状态: {initial_active}/{total_carriers} 个活跃载流子")
+        
+        for step in range(max_steps):
+            if step % 100 == 0:
+                self._log_progress(step, total_carriers)
+            
+            n_terminated = self.drift_step_batch(my_d, field_cache, delta_t, delta_t_cm, step)
+            self.performance_stats['total_steps'] += 1
+            
+            if not np.any(self.active):
+                logger.info("所有载流子停止漂移")
+                break
+        
+        self._log_final_stats(start_time, max_steps)
+        return True
+
+    def drift_step_batch(self, my_d, field_cache, delta_t, delta_t_cm, step=0):
+        """批量单步漂移 """
+        if not np.any(self.active):
+            return 0
+            
+        n_terminated = 0
+        params = self.detector_params
+        
+        # 预计算扩散常数
+        diffusion_constant = math.sqrt(2.0 * self.kboltz * params['temperature'] * delta_t) * 1e4
+        
+        for idx in range(len(self.active)):
+            if not self.active[idx]:
+                continue
+                
+            x, y, z = self.positions[idx]
+            charge = self.charges[idx]
+            
+            # 边界检查
+            self.performance_stats['boundary_checks'] += 1
+            if self._check_boundary_conditions(x, y, z):
+                self.active[idx] = False
+                self.end_conditions[idx] = 1
+                n_terminated += 1
+                self.performance_stats['boundary_terminations'] += 1
+                continue
+            
+            # 时间检查
+            if self.times[idx] > params['max_drift_time']:
+                self.active[idx] = False
+                self.end_conditions[idx] = 4
+                n_terminated += 1
+                continue
+            
+            # 电场获取和处理
+            e_field = self._get_e_field_safe(field_cache, x, y, z, idx)
+            if e_field is None:
+                continue
+                
+            Ex, Ey, Ez = e_field
+            intensity = math.sqrt(Ex*Ex + Ey*Ey + Ez*Ez)
+            
+            # 电场强度检查（降低阈值）
+            if intensity <= params['min_field_strength']:
+                self.active[idx] = False
+                self.end_conditions[idx] = 3
+                n_terminated += 1
+                self.performance_stats['low_field_terminations'] += 1
+                continue
+            
+            # 迁移率计算
+            try:
+                doping = field_cache.get_doping_cached(x, y, z)
+                mu = self._calculate_correct_mobility(params['temperature'], doping, charge, e_field)
+            except Exception as e:
+                mu = 1350.0 if charge < 0 else 480.0
+            
+            # 速度和位移计算
+            delta_x, delta_y, delta_z = self._calculate_displacement(charge, e_field, mu, delta_t_cm)
+            
+            # 扩散位移（考虑复合载流子数量带来的噪声放大效应）
+            dif_x, dif_y, dif_z = self._calculate_diffusion(diffusion_constant, mu, charge)
+            
+            # 更新位置
+            self._update_carrier_position(idx, delta_x, delta_y, delta_z, dif_x, dif_y, dif_z, delta_t)
+        
+        self.performance_stats['carriers_terminated'] += n_terminated
+        return n_terminated
+
+    def _get_e_field_safe(self, field_cache, x, y, z, idx):
+        """安全的电场获取"""
+        try:
         try:
             value = getattr(my_d, param_name, default)
             return param_type(value)
@@ -893,6 +1147,26 @@ class VectorizedCarrierSystem:
         
         return vx * delta_t_cm, vy * delta_t_cm, vz * delta_t_cm
 
+    def _calculate_diffusion(self, diffusion_constant, mu, charge):
+        """计算扩散位移，考虑复合载流子的统计平均效应"""
+        try:
+            mobility = max(mu, 0.0)
+            if mobility == 0.0:
+                return 0.0, 0.0, 0.0
+
+            diffusion_sigma = diffusion_constant * math.sqrt(mobility)
+
+            # 复合载流子：中心扩散宽度 ~ 1/sqrt(N)，避免出现非物理噪声放大
+            carrier_count = max(1.0, abs(charge))
+            diffusion_sigma /= math.sqrt(carrier_count)
+
+            diffs = (
+                self._gauss(0.0, diffusion_sigma),
+                self._gauss(0.0, diffusion_sigma),
+                self._gauss(0.0, diffusion_sigma),
+            )
+            return diffs
+        except Exception:
     def _calculate_diffusion(self, diffusion_constant, mu):
         """计算扩散位移"""
         try:
