@@ -8,7 +8,6 @@ Description:
 @version    : 2.0
 '''
 
-import random
 import math
 import os
 from array import array
@@ -18,6 +17,45 @@ import numpy as np
 import ROOT
 ROOT.gROOT.SetBatch(True)
 
+
+def _import_first_available(*candidates):
+    """尝试依次导入候选模块，返回第一个成功的模块对象。"""
+
+    last_error = None
+    for dotted_path in candidates:
+        try:
+            return importlib.import_module(dotted_path)
+        except ModuleNotFoundError as exc:
+            last_error = exc
+        except ImportError as exc:  # 兼容较老 Python 版本的错误类型
+            last_error = exc
+
+    # 将最后一次导入错误转换成更易读的消息
+    raise ModuleNotFoundError(
+        "无法定位以下任一模块: {}".format(
+            ", ".join(candidates)
+        )
+    ) from last_error
+
+
+Material = _import_first_available("model", "raser.model", "current.model").Material
+CarrierListFromG4P = _import_first_available(
+    "interaction.carrier_list",
+    "raser.interaction.carrier_list",
+    "current.interaction.carrier_list",
+).CarrierListFromG4P
+math_module = _import_first_available(
+    "util.math",
+    "raser.util.math",
+    "current.util.math",
+)
+Vector = math_module.Vector
+signal_convolution = math_module.signal_convolution
+output = _import_first_available(
+    "util.output",
+    "raser.util.output",
+    "current.util.output",
+).output
 from .model import Material
 from interaction.carrier_list import CarrierListFromG4P
 from util.math import Vector, signal_convolution
@@ -53,7 +91,7 @@ class CarrierCluster:
     Modify:
         2022/10/28
     """
-    def __init__(self, x_init, y_init, z_init, t_init, p_x, p_y, n_x, n_y, l_x, l_y, field_shift_x, field_shift_y, charge, material, weighting_field):
+    def __init__(self, x_init, y_init, z_init, t_init, p_x, p_y, n_x, n_y, l_x, l_y, field_shift_x, field_shift_y, charge, material, weighting_field, rng=None):
         self.x = x_init
         self.y = y_init
         self.z = z_init
@@ -91,6 +129,9 @@ class CarrierCluster:
         if self.charge == 0:
             self.end_condition = "zero charge"
 
+        # 随机源：默认直接使用模块 random，也支持注入自定义 RNG
+        self._gauss = _resolve_gauss_sampler(rng)
+
     def not_in_sensor(self,my_d):
         if (self.x<=0) or (self.x>=my_d.l_x)\
             or (self.y<=0) or (self.y>=my_d.l_y)\
@@ -125,21 +166,22 @@ class CarrierCluster:
             self.end_condition = "zero velocity"
             return
 
-        # Since the signal amplitude is proportional to charge:
-        # - For n charge carriers (each with charge q) undergoing random walks with diffusion coefficient D,
-        #   the variance of signal perturbation becomes n times that of a single charge carrier
-        # - A single charge carrier with charge n*q under the same diffusion conditions
-        #   also produces signal perturbation variance n times that of a single charge
-        # This equivalence implies that a group of charge carriers can be treated as
-        # a single composite carrier when modeling random walk behavior,
-        # provided their total charge and diffusion characteristics are properly scaled
+        # 将多个载流子视作一组时，需要缩小随机扩散步长，避免把全部电荷绑在同一条随机路径上
+        # 导致信号方差被非物理地放大
 
         kboltz=8.617385e-5 #eV/K
         diffusion = (2.0*kboltz*mu*my_d.temperature*delta_t)**0.5
 
-        dif_x=random.gauss(0.0,diffusion)*1e4
-        dif_y=random.gauss(0.0,diffusion)*1e4
-        dif_z=random.gauss(0.0,diffusion)*1e4
+        # 根据复合载流子数量缩放扩散步长，降低非物理噪声
+        carrier_count = max(1.0, abs(self.charge))
+        diffusion /= math.sqrt(carrier_count)
+
+        diffs = (
+            self._gauss(0.0, diffusion) * 1e4,
+            self._gauss(0.0, diffusion) * 1e4,
+            self._gauss(0.0, diffusion) * 1e4,
+        )
+        dif_x, dif_y, dif_z = diffs
 
         # sum up
         # x axis   
